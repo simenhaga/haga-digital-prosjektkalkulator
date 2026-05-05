@@ -1,14 +1,31 @@
 import json
+import os
+import uuid
 from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
 from streamlit_lightweight_charts import renderLightweightCharts
 
+try:
+    from supabase import create_client
+except ImportError:
+    create_client = None
+
 st.set_page_config(page_title="Haga Digital ENK-kalkulator", page_icon="💼", layout="wide")
 
 LOGO_PATH = Path("assets/logo2.png")
 ANNUAL_COSTS_PATH = Path("assets/annual_costs.json")
+
+
+def get_secret(name: str, default=None):
+    return st.secrets[name] if name in st.secrets else os.getenv(name, default)
+
+
+SUPABASE_URL = get_secret("SUPABASE_URL", "")
+SUPABASE_SERVICE_ROLE_KEY = get_secret("SUPABASE_SERVICE_ROLE_KEY", "")
+APP_USER_ID = str(get_secret("APP_USER_ID", "00000000-0000-0000-0000-000000000001"))
+USE_SUPABASE = str(get_secret("USE_SUPABASE", "false")).lower() == "true"
 
 PALETTE = {
     "bg": "#F7F8FB",
@@ -189,6 +206,112 @@ def card_end():
     st.markdown("</div>", unsafe_allow_html=True)
 
 
+@st.cache_resource
+def get_supabase_client():
+    if create_client is None:
+        raise RuntimeError("Supabase-pakken er ikke installert. Kjør: pip install supabase")
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise RuntimeError("Mangler SUPABASE_URL eller SUPABASE_SERVICE_ROLE_KEY i secrets/env")
+    return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+
+def format_saved_at(iso_value: str) -> str:
+    if not iso_value:
+        return datetime.now().strftime("%Y-%m-%d %H:%M")
+    try:
+        normalized = iso_value.replace("Z", "+00:00")
+        return datetime.fromisoformat(normalized).strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return iso_value
+
+
+def load_annual_costs_db(user_id: str) -> list[dict]:
+    client = get_supabase_client()
+    response = (
+        client.table("annual_costs")
+        .select("name, amount, sort_order")
+        .eq("user_id", user_id)
+        .order("sort_order", desc=False)
+        .execute()
+    )
+    data = response.data or []
+    items: list[dict] = []
+    for idx, item in enumerate(data, start=1):
+        items.append(
+            {
+                "id": idx,
+                "name": str(item.get("name", "")).strip(),
+                "amount": max(0.0, float(item.get("amount", 0.0))),
+            }
+        )
+    return items
+
+
+def save_annual_costs_db(user_id: str, items: list[dict]):
+    client = get_supabase_client()
+    payload = []
+    for idx, item in enumerate(items, start=1):
+        name = str(item.get("name", "")).strip()
+        amount = max(0.0, float(item.get("amount", 0.0)))
+        if not name:
+            continue
+        payload.append({"user_id": user_id, "name": name, "amount": amount, "sort_order": idx})
+
+    client.table("annual_costs").delete().eq("user_id", user_id).execute()
+    if payload:
+        client.table("annual_costs").insert(payload).execute()
+
+
+def load_saved_projects_db(user_id: str) -> list[dict]:
+    client = get_supabase_client()
+    response = (
+        client.table("projects")
+        .select("id, name, mode, saved_at, result_json, extra_json")
+        .eq("user_id", user_id)
+        .order("saved_at", desc=True)
+        .execute()
+    )
+    data = response.data or []
+    projects: list[dict] = []
+    for item in data:
+        projects.append(
+            {
+                "db_id": item.get("id"),
+                "saved_at": format_saved_at(str(item.get("saved_at", ""))),
+                "name": str(item.get("name", "Prosjekt")),
+                "mode": str(item.get("mode", "Prosjektkalkulator")),
+                "result": item.get("result_json") or {},
+                "extra": item.get("extra_json") or {},
+            }
+        )
+    return projects
+
+
+def create_saved_project_db(user_id: str, name: str, mode: str, result: dict, extra: dict):
+    client = get_supabase_client()
+    payload = {
+        "id": str(uuid.uuid4()),
+        "user_id": user_id,
+        "name": name,
+        "mode": mode,
+        "saved_at": datetime.utcnow().isoformat(),
+        "result_json": result,
+        "extra_json": extra,
+    }
+    client.table("projects").insert(payload).execute()
+
+
+def update_saved_project_db(user_id: str, db_id: str, name: str, mode: str):
+    client = get_supabase_client()
+    payload = {"name": name, "mode": mode, "saved_at": datetime.utcnow().isoformat()}
+    client.table("projects").update(payload).eq("id", db_id).eq("user_id", user_id).execute()
+
+
+def delete_saved_project_db(user_id: str, db_id: str):
+    client = get_supabase_client()
+    client.table("projects").delete().eq("id", db_id).eq("user_id", user_id).execute()
+
+
 DEFAULTS = {
     "mva_rate": 25.0,
     "skatt_rate": 35.0,
@@ -201,11 +324,19 @@ DEFAULTS = {
 
 def init_state():
     if "annual_costs" not in st.session_state:
-        st.session_state.annual_costs = load_annual_costs()
+        try:
+            st.session_state.annual_costs = load_annual_costs_db(APP_USER_ID) if USE_SUPABASE else load_annual_costs()
+        except Exception as exc:
+            st.warning(f"Kunne ikke hente årlige kostnader fra Supabase, bruker lokal fil i stedet. ({exc})")
+            st.session_state.annual_costs = load_annual_costs()
     if "project_expenses" not in st.session_state:
         st.session_state.project_expenses = [{"id": 1, "name": "Prosjektkostnad 1", "amount": 0.0}]
     if "saved_projects" not in st.session_state:
-        st.session_state.saved_projects = []
+        try:
+            st.session_state.saved_projects = load_saved_projects_db(APP_USER_ID) if USE_SUPABASE else []
+        except Exception as exc:
+            st.warning(f"Kunne ikke hente lagrede prosjekter fra Supabase. ({exc})")
+            st.session_state.saved_projects = []
     if "prosjektpris" not in st.session_state:
         st.session_state.prosjektpris = 0.0
     if "prosjektkostnader" not in st.session_state:
@@ -217,12 +348,22 @@ def init_state():
 def add_annual_cost():
     next_id = max((item["id"] for item in st.session_state.annual_costs), default=0) + 1
     st.session_state.annual_costs.append({"id": next_id, "name": f"Årlig kostnad {next_id}", "amount": 0.0})
-    save_annual_costs(st.session_state.annual_costs)
+    persist_annual_costs(st.session_state.annual_costs)
 
 
 def remove_annual_cost(item_id: int):
     st.session_state.annual_costs = [item for item in st.session_state.annual_costs if item["id"] != item_id]
-    save_annual_costs(st.session_state.annual_costs)
+    persist_annual_costs(st.session_state.annual_costs)
+
+
+def persist_annual_costs(items: list[dict]):
+    if USE_SUPABASE:
+        try:
+            save_annual_costs_db(APP_USER_ID, items)
+        except Exception as exc:
+            st.error(f"Kunne ikke lagre årlige kostnader i Supabase. ({exc})")
+    else:
+        save_annual_costs(items)
 
 
 def load_annual_costs() -> list[dict]:
@@ -361,6 +502,14 @@ def vis_resultater(resultat: dict, overskrift: str):
 
 
 def save_project(name: str, mode: str, result: dict, extra: dict):
+    if USE_SUPABASE:
+        try:
+            create_saved_project_db(APP_USER_ID, name, mode, result, extra)
+            st.session_state.saved_projects = load_saved_projects_db(APP_USER_ID)
+        except Exception as exc:
+            st.error(f"Kunne ikke lagre prosjekt i Supabase. ({exc})")
+        return
+
     st.session_state.saved_projects.append(
         {
             "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -372,8 +521,36 @@ def save_project(name: str, mode: str, result: dict, extra: dict):
     )
 
 
+def update_saved_project(index: int, name: str, mode: str):
+    if not (0 <= index < len(st.session_state.saved_projects)):
+        return
+
+    project = st.session_state.saved_projects[index]
+    if USE_SUPABASE and project.get("db_id"):
+        try:
+            update_saved_project_db(APP_USER_ID, str(project["db_id"]), name, mode)
+            st.session_state.saved_projects = load_saved_projects_db(APP_USER_ID)
+        except Exception as exc:
+            st.error(f"Kunne ikke oppdatere prosjekt i Supabase. ({exc})")
+        return
+
+    updated = dict(project)
+    updated["name"] = name
+    updated["mode"] = mode
+    updated["saved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    st.session_state.saved_projects[index] = updated
+
+
 def delete_saved_project(index: int):
     if 0 <= index < len(st.session_state.saved_projects):
+        project = st.session_state.saved_projects[index]
+        if USE_SUPABASE and project.get("db_id"):
+            try:
+                delete_saved_project_db(APP_USER_ID, str(project["db_id"]))
+                st.session_state.saved_projects = load_saved_projects_db(APP_USER_ID)
+                return
+            except Exception as exc:
+                st.error(f"Kunne ikke slette prosjekt i Supabase. ({exc})")
         st.session_state.saved_projects.pop(index)
 
 
@@ -489,7 +666,7 @@ with st.sidebar:
             st.rerun()
         updated_annual_costs.append({"id": item["id"], "name": name, "amount": amount})
     st.session_state.annual_costs = updated_annual_costs
-    save_annual_costs(st.session_state.annual_costs)
+    persist_annual_costs(st.session_state.annual_costs)
     totale_aarlige_kostnader = total_from_items(st.session_state.annual_costs)
     st.write(f"Totale årlige faste kostnader: **{nok(totale_aarlige_kostnader)}**")
 
@@ -677,11 +854,7 @@ with tab3:
 
                     c1, c2 = st.columns(2)
                     if c1.button("Lagre endringer", key=f"update_project_{i}", use_container_width=True):
-                        updated = dict(project)
-                        updated["name"] = edited_name
-                        updated["mode"] = edited_mode
-                        updated["saved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-                        st.session_state.saved_projects[i] = updated
+                        update_saved_project(i, edited_name, edited_mode)
                         st.session_state.editing_saved_project_index = None
                         st.success("Prosjekt oppdatert.")
                         st.rerun()
