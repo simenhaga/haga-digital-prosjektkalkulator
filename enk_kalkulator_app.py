@@ -3,6 +3,7 @@ import os
 import uuid
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import streamlit as st
 from streamlit_lightweight_charts import renderLightweightCharts
@@ -11,6 +12,11 @@ try:
     from supabase import create_client
 except ImportError:
     create_client = None
+
+try:
+    from fpdf import FPDF
+except ImportError:
+    FPDF = None
 
 st.set_page_config(page_title="Haga Digital ENK-kalkulator", page_icon="💼", layout="wide")
 
@@ -172,7 +178,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-
 def nok(value: float) -> str:
     return f"{value:,.0f} kr".replace(",", " ")
 
@@ -223,6 +228,141 @@ def format_saved_at(iso_value: str) -> str:
         return datetime.fromisoformat(normalized).strftime("%Y-%m-%d %H:%M")
     except ValueError:
         return iso_value
+
+
+def safe_pdf_text(value) -> str:
+    return str(value).replace("•", "-")
+
+
+def pdf_line(pdf: Any, text: str, line_height: float = 8):
+    # Reset x before each line to avoid ending up with near-zero render width.
+    pdf.set_x(pdf.l_margin)
+    max_width = pdf.w - pdf.l_margin - pdf.r_margin
+    pdf.multi_cell(max_width, line_height, safe_pdf_text(text))
+
+
+def build_offer_pdf(project: dict) -> bytes:
+    if FPDF is None:
+        raise RuntimeError("FPDF er ikke installert. Kjør: pip install fpdf2")
+
+    result = project.get("result", {}) or {}
+    extra = project.get("extra", {}) or {}
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    if LOGO_PATH.exists():
+        try:
+            pdf.image(str(LOGO_PATH), x=pdf.w - pdf.r_margin - 42, y=12, w=42)
+        except Exception:
+            # If image loading fails we still generate a valid PDF.
+            pass
+
+    pdf.set_font("Helvetica", "B", 18)
+    pdf_line(pdf, "Prosjekttilbud", line_height=10)
+    pdf.ln(2)
+
+    pdf.set_font("Helvetica", size=11)
+    pdf_line(pdf, f"Dato: {datetime.now().strftime('%Y-%m-%d')}")
+    pdf_line(pdf, f"Prosjekt: {project.get('name', 'Prosjekt')}")
+    pdf_line(pdf, f"Type: {project.get('mode', 'Prosjektkalkulator')}")
+    pdf_line(pdf, f"Sist lagret: {project.get('saved_at', '')}")
+    pdf.ln(6)
+
+    pdf.set_font("Helvetica", "B", 13)
+    pdf_line(pdf, "Nokkeltall")
+    pdf.set_font("Helvetica", size=11)
+
+    lines = [
+        f"Prosjektpris eks. mva: {nok(float(result.get('prosjektpris_eks_mva', 0.0)))}",
+        f"Faktura inkl. mva: {nok(float(result.get('faktura_inkl_mva', 0.0)))}",
+        f"MVA a sette av: {nok(float(result.get('mva_belop', 0.0)))}",
+        f"Totale kostnader: {nok(float(result.get('totale_kostnader', 0.0)))}",
+        f"Resultat for skatt: {nok(float(result.get('resultat_for_skatt', 0.0)))}",
+        f"Estimert skatt: {nok(float(result.get('estimert_skatt', 0.0)))}",
+        f"Mulig privatuttak etter skatt: {nok(float(result.get('netto_etter_skatt', 0.0)))}",
+        f"Anbefalt avsetning: {nok(float(result.get('anbefalt_avsetning', 0.0)))}",
+    ]
+
+    for line in lines:
+        pdf_line(pdf, f"- {line}")
+
+    pdf.ln(3)
+    pdf.set_font("Helvetica", "B", 13)
+    pdf_line(pdf, "Prosjektgrunnlag")
+    pdf.set_font("Helvetica", size=11)
+
+    if project.get("mode") == "Timepriskalkulator":
+        pdf_line(pdf, f"- Timepris eks. mva: {nok(float(extra.get('timepris', 0.0)))}")
+        pdf_line(pdf, f"- Antall timer: {float(extra.get('antall_timer', 0.0)):.1f}")
+        pdf_line(pdf, f"- Prosjektkostnader: {nok(float(extra.get('prosjektkostnader', 0.0)))}")
+    else:
+        pdf_line(pdf, f"- Fastpris eks. mva: {nok(float(extra.get('prosjektpris', result.get('prosjektpris_eks_mva', 0.0))))}")
+        project_expenses = extra.get("project_expenses", []) or []
+        if project_expenses:
+            pdf_line(pdf, "- Prosjektutgifter:")
+            for item in project_expenses:
+                item_name = str(item.get("name", "Prosjektutgift")).strip() or "Prosjektutgift"
+                item_amount = float(item.get("amount", 0.0))
+                pdf_line(pdf, f"  - {item_name}: {nok(item_amount)}")
+
+    annual_costs = extra.get("annual_costs", []) or []
+    if annual_costs:
+        pdf.ln(2)
+        pdf_line(pdf, "Arlige kostnader inkludert i kalkylen:")
+        for item in annual_costs:
+            item_name = str(item.get("name", "Kostnad")).strip() or "Kostnad"
+            item_amount = float(item.get("amount", 0.0))
+            pdf_line(pdf, f"- {item_name}: {nok(item_amount)}")
+
+    pdf.ln(4)
+    pdf.set_font("Helvetica", "I", 9)
+    pdf_line(
+        pdf,
+        "Dette dokumentet er et automatisk generert estimat basert pa oppgitte forutsetninger og erstatter ikke regnskaps- eller skatteradgivning.",
+        line_height=6,
+    )
+
+    content = pdf.output(dest="S")
+    if isinstance(content, bytearray):
+        return bytes(content)
+    if isinstance(content, bytes):
+        return content
+    return content.encode("latin-1", errors="replace")
+
+
+def load_project_into_calculators(project: dict):
+    mode = str(project.get("mode", ""))
+    extra = project.get("extra", {}) or {}
+
+    if mode == "Timepriskalkulator":
+        st.session_state["timepris_input"] = float(extra.get("timepris", 1200.0))
+        st.session_state["antall_timer_input"] = float(extra.get("antall_timer", 40.0))
+        st.session_state["prosjektkostnader_time_input"] = float(extra.get("prosjektkostnader", 0.0))
+        st.session_state["resume_message"] = "Prosjekt lastet. Gå til fanen Timepriskalkulator for å fortsette."
+        st.session_state["resume_mode"] = "Timepriskalkulator"
+        return
+
+    st.session_state.prosjektpris = float(extra.get("prosjektpris", project.get("result", {}).get("prosjektpris_eks_mva", 0.0)))
+    loaded_expenses = extra.get("project_expenses", []) or []
+    if loaded_expenses:
+        normalized = []
+        for idx, item in enumerate(loaded_expenses, start=1):
+            name = str(item.get("name", f"Prosjektkostnad {idx}"))
+            amount = float(item.get("amount", 0.0))
+            normalized.append(
+                {
+                    "id": idx,
+                    "name": name,
+                    "amount": amount,
+                }
+            )
+            st.session_state[f"project_name_{idx}"] = name
+            st.session_state[f"project_amount_{idx}"] = amount
+        st.session_state.project_expenses = normalized
+    st.session_state["resume_message"] = "Prosjekt lastet. Gå til fanen Prosjektkalkulator for å fortsette."
+    st.session_state["resume_mode"] = "Prosjektkalkulator"
 
 
 def load_annual_costs_db(user_id: str) -> list[dict]:
@@ -627,6 +767,10 @@ def series_compare(income_data: list[dict], withdrawal_data: list[dict], key: st
 
 init_state()
 
+resume_message = st.session_state.pop("resume_message", "")
+if resume_message:
+    st.success(resume_message)
+
 if LOGO_PATH.exists():
     with st.sidebar:
         st.image(str(LOGO_PATH), use_container_width=True)
@@ -773,13 +917,26 @@ with tab2:
     st.write("Sett timepris og antall timer for å se hva prosjektet faktisk gir deg.")
 
     t1, t2 = st.columns(2)
-    timepris = t1.number_input("Timepris eks. mva", min_value=0.0, value=1200.0, step=100.0)
-    antall_timer = t2.number_input("Antall timer", min_value=0.0, value=40.0, step=1.0)
+    timepris = t1.number_input(
+        "Timepris eks. mva",
+        min_value=0.0,
+        value=1200.0,
+        step=100.0,
+        key="timepris_input",
+    )
+    antall_timer = t2.number_input(
+        "Antall timer",
+        min_value=0.0,
+        value=40.0,
+        step=1.0,
+        key="antall_timer_input",
+    )
     prosjektspesifikke_kostnader_time = st.number_input(
         "Totale prosjektkostnader for dette timeprosjektet",
         min_value=0.0,
         value=0.0,
         step=100.0,
+        key="prosjektkostnader_time_input",
     )
 
     resultat_time = beregn_timepris(
@@ -832,15 +989,37 @@ with tab3:
                 a2.metric("Sett av til skatt + MVA", nok(project["result"]["anbefalt_avsetning"]))
                 a3.metric("Mulig privatuttak", nok(project["result"]["netto_etter_skatt"]))
 
-                b1, b2 = st.columns([1, 1])
-                if b1.button("Endre", key=f"edit_project_{i}", use_container_width=True):
+                b1, b2, b3, b4 = st.columns([1, 1, 1, 1.2])
+                if b1.button("Fortsett senere", key=f"resume_project_{i}", use_container_width=True):
+                    load_project_into_calculators(project)
+                    st.rerun()
+                if b2.button("Endre", key=f"edit_project_{i}", use_container_width=True):
                     st.session_state.editing_saved_project_index = i
-                if b2.button("Slett", key=f"delete_project_{i}", use_container_width=True):
+                if b3.button("Slett", key=f"delete_project_{i}", use_container_width=True):
                     delete_saved_project(i)
                     if st.session_state.editing_saved_project_index == i:
                         st.session_state.editing_saved_project_index = None
                     st.success("Prosjekt slettet.")
                     st.rerun()
+
+                pdf_error = None
+                pdf_data = None
+                try:
+                    pdf_data = build_offer_pdf(project)
+                except Exception as exc:
+                    pdf_error = str(exc)
+
+                if pdf_data is not None:
+                    b4.download_button(
+                        "Last ned tilbud (PDF)",
+                        data=pdf_data,
+                        file_name=f"tilbud_{project['name'].replace(' ', '_').lower()}.pdf",
+                        mime="application/pdf",
+                        key=f"download_pdf_{i}",
+                        use_container_width=True,
+                    )
+                elif pdf_error:
+                    b4.caption(f"PDF utilgjengelig: {pdf_error}")
 
                 if st.session_state.editing_saved_project_index == i:
                     st.markdown("### Rediger prosjekt")

@@ -32,7 +32,7 @@ USE_SUPABASE = "true"
 ### 4) Installer avhengigheter
 
 ```bash
-pip install streamlit streamlit-lightweight-charts supabase
+pip install streamlit streamlit-lightweight-charts supabase fpdf2
 ```
 
 ### 5) Kjor appen
